@@ -1,8 +1,11 @@
 param (
     $CampaignId,
-    $CampaignName = "Access Profile Definition Campaign"
+    $CampaignName = "Access Profile Definition Campaign",
+    $SourceOwnerName = "SailPoint.Workflow",
+    $SourceOwnerId = "9e95ffec295143eca85d7d917c3bb3dc"
 )
 
+[int]$MaxRetries = "10"
 $LogDate = Get-Date -UFormat "%Y%m%d"
 $LogFile = ".\Logs_$LogDate.log"
 
@@ -32,13 +35,32 @@ if (!$CampaignId) {
 
 LogToFile("Processing Campaign with ID: [$CampaignId]")
 
-# Get Certification Item
-$SourceOwnerCertificationId = $(Get-IdentityCertifications -Filters "campaign.id eq `"$CampaignId`"").id
+# Get Certification Item of the Default Source Owner
+$SourceOwnerCertificationId
+$Parameters = @{
+    "Filters" = "campaign.id eq `"$CampaignId`""
+}
+$CertificationItems = Invoke-Paginate -Function "Get-IdentityCertifications" -Increment 250 -Parameters $Parameters
+foreach ($CertificationItem in $CertificationItems) {
+    if ($CertificationItem.reviewer.id -eq $SourceOwnerId || $CertificationItem.reviewer.name -eq $SourceOwnerName) {
+        $SourceOwnerCertificationId = $CertificationItem.id
+        Break
+    }
+}
+
+# Exit if could not find the Source Owner Certificaiton ID
+if (!$SourceOwnerCertificationId) {
+    LogToFile("Could not find a valid Certification Item ID using Source Owner Name: [$SourceOwnerName] and ID: [$SourceOwnerId]")
+    Exit
+}
 
 LogToFile("Listing the Access Review Items under Certification: [$SourceOwnerCertificationId]")
 
 # Get All Access Review Items within the Certification
-$AllAccessReviewItems = Get-IdentityAccessReviewItems -Id "$SourceOwnerCertificationId"
+$Parameters = @{
+    "Id" = "$SourceOwnerCertificationId"
+}
+$AllAccessReviewItems = Invoke-Paginate -Function "Get-IdentityAccessReviewItems" -Increment 250 -Parameters $Parameters
 
 # Prepare a data structure to store all Access Review Item IDs per Reviewer
 $AccessReviewItemsPerOwner = @{}
@@ -80,8 +102,29 @@ foreach ( $OwnerId in $AccessReviewItemsPerOwner.Keys ) {
     }
 "@
     $AccessReviewReassignBody = ConvertFrom-JsonToAccessReviewReassignment -Json $ReassignBody
-    # Reassign Items for the current Owner
-    Invoke-ReassignIdentityCertifications -Id "$SourceOwnerCertificationId" -ReviewReassign $AccessReviewReassignBody
+
+    # Retry till successful logic
+    $StopLoop = $false
+    [int]$Retries = "0"
+    do {
+        try {
+            # Reassign Items for the current Owner
+            Invoke-ReassignIdentityCertifications -Id "$SourceOwnerCertificationId" -ReviewReassign $AccessReviewReassignBody
+            $StopLoop = $true
+        }
+        catch {
+            LogToFile("Error Trial [$Retries] Reassigning [$($AccessReviewItemIds.Count)] Access Review Items for Owner ID: [$OwnerId]!")
+            if ($Retries -gt $MaxRetries) {
+                LogToFile("Exceeded Retry Threshold for Reassigning [$($AccessReviewItemIds.Count)] Access Review Items for Owner ID: [$OwnerId]!")
+                $StopLoop = $true
+            }
+            else {
+                $Retries = $Retries + 1
+                Start-Sleep -Seconds 5
+            }
+        }
+    }
+    while ($StopLoop -eq $true)
 }
 
 LogToFile("Activating Campaign [$CampaignId] after finishing reassignment")

@@ -5,9 +5,10 @@ param (
     $SourceOwnerId = "9e95ffec295143eca85d7d917c3bb3dc"
 )
 
-[int]$MaxRetries = "10"
+[int]$ReassignLimit = "50"
 $LogDate = Get-Date -UFormat "%Y%m%d"
 $LogFile = ".\Logs_$LogDate.log"
+Set-DefaultConfiguration -MaximumRetryCount 10 -RetryIntervalSeconds 5
 
 #====================-------Helper functions-------====================
 function LogToFile([String] $Info) {
@@ -54,79 +55,72 @@ if (!$SourceOwnerCertificationId) {
     Exit
 }
 
-LogToFile("Listing the Access Review Items under Certification: [$SourceOwnerCertificationId]")
+LogToFile("Listing the Certification Summary Items under Certification: [$SourceOwnerCertificationId]")
 
-# Get All Access Review Items within the Certification
+# Get All Certification Summary Items within the Certification
 $Parameters = @{
     "Id" = "$SourceOwnerCertificationId"
 }
-$AllAccessReviewItems = Invoke-Paginate -Function "Get-IdentityAccessReviewItems" -Increment 250 -Parameters $Parameters
+$AllCertificationSummaryItems = Invoke-Paginate -Function "Get-IdentitySummaries" -Increment 250 -Parameters $Parameters
 
 # Prepare a data structure to store all Access Review Item IDs per Reviewer
-$AccessReviewItemsPerOwner = @{}
-foreach ( $AccessReviewItem in $AllAccessReviewItems ) {
+$CertificationSummaryItemsPerOwner = @{}
+foreach ( $CertificationSummaryItem in $AllCertificationSummaryItems ) {
     # Get the Owner ID from the Account attributes
-    $AccountId = $AccessReviewItem.accessSummary.entitlement.account.id
-    $OwnerId = $(Get-Account -Id $AccountId).attributes.ownerId
+    $AccessProfileName = $CertificationSummaryItem.name
+    $AccessProfile = Get-AccessProfiles -Filters "name eq `"$AccessProfileName`""
+    $OwnerId = $AccessProfile.owner.id
     # Get the existing list
-    $AccessReviewItems = $AccessReviewItemsPerOwner[$OwnerId]
-    if (!$AccessReviewItems) {
+    $CertificationSummaryItems = $CertificationSummaryItemsPerOwner[$OwnerId]
+    if (!$CertificationSummaryItems) {
         # Create a new list if it does not exist
-        $AccessReviewItems = [System.Collections.ArrayList]::new()
+        $CertificationSummaryItems = [System.Collections.ArrayList]::new()
     }
     # Add Current Access Review Item ID to the Owner ID
-    $AccessReviewItems.Add($AccessReviewItem.id)
-    $AccessReviewItemsPerOwner[$OwnerId] = $AccessReviewItems
+    $CertificationSummaryItems.Add($CertificationSummaryItem.id)
+    $CertificationSummaryItemsPerOwner[$OwnerId] = $CertificationSummaryItems
 }
 
 # Start the Reassignment Process
-foreach ( $OwnerId in $AccessReviewItemsPerOwner.Keys ) {
-    # Get Access Review Items
-    $AccessReviewItemIds = $AccessReviewItemsPerOwner[$OwnerId]
-    LogToFile("Reassigning [$($AccessReviewItemIds.Count)] Access Review Items for Owner ID: [$OwnerId]")
-    # Build the Reassign Item List
-    $ItemList = [System.Collections.ArrayList]::new()
-    foreach ( $AccessReviewItemId in $AccessReviewItemIds ) {
-        $ItemList.Add(@{
-                id   = "$AccessReviewItemId"
-                type = "ITEM"
-            })
-    }
-    $ItemListJSON = ConvertTo-Json -InputObject $ItemList
-    # Build the Reassign Request Body
-    $ReassignBody = @"
-    {
-        "reason":"Reassigning to Access Profile Owner",
-        "reassignTo":"$OwnerId",
-        "reassign": $ItemListJSON
-    }
-"@
-    $AccessReviewReassignBody = ConvertFrom-JsonToAccessReviewReassignment -Json $ReassignBody
-
-    # Retry till successful logic
-    $StopLoop = $false
-    [int]$Retries = "0"
+foreach ( $OwnerId in $CertificationSummaryItemsPerOwner.Keys ) {
+    # Get Certification Summary Items
+    $CertificationSummaryItemIds = $CertificationSummaryItemsPerOwner[$OwnerId]
+    LogToFile("Reassigning [$($CertificationSummaryItemIds.Count)] Certification Summary Items for Owner ID: [$OwnerId]")
     do {
+        # Build the Reassign Item List
+        $ItemList = [System.Collections.ArrayList]::new()
+        $Limit = (@($ReassignLimit, $CertificationSummaryItemIds.Count) | Measure-Object -Minimum).Minimum
+        for ( $i = 0; $i -lt $Limit; $i++ ) {
+            $CertificationSummaryItemId = $CertificationSummaryItemIds[0]
+            $CertificationSummaryItemIds.RemoveAt(0)
+            $ItemList.Add(@{
+                    id   = "$CertificationSummaryItemId"
+                    type = "TARGET_SUMMARY"
+                })
+        }
+        $ItemListJSON = ConvertTo-Json -InputObject $ItemList
+        # Build the Reassign Request Body
+        $ReassignBody = @"
+        {
+            "reason":"Reassigning to Access Profile Owner",
+            "reassignTo":"$OwnerId",
+            "reassign": $ItemListJSON
+        }
+"@
+        $AccessReviewReassignBody = ConvertFrom-JsonToAccessReviewReassignment -Json $ReassignBody
+        # Reassign Items for the current Owner
         try {
-            # Reassign Items for the current Owner
             Invoke-ReassignIdentityCertifications -Id "$SourceOwnerCertificationId" -ReviewReassign $AccessReviewReassignBody
-            $StopLoop = $true
         }
         catch {
-            LogToFile("Error Trial [$Retries] Reassigning [$($AccessReviewItemIds.Count)] Access Review Items for Owner ID: [$OwnerId]!")
-            if ($Retries -gt $MaxRetries) {
-                LogToFile("Exceeded Retry Threshold for Reassigning [$($AccessReviewItemIds.Count)] Access Review Items for Owner ID: [$OwnerId]!")
-                $StopLoop = $true
-            }
-            else {
-                $Retries = $Retries + 1
-                Start-Sleep -Seconds 5
-            }
+            LogToFile("Error Reassigning [$($ItemList.Count)] Certification Summary Items for Owner ID: [$OwnerId]!")
         }
     }
-    while ($StopLoop -eq $true)
+    while ($CertificationSummaryItemIds.Count -gt "0")
 }
 
+# Wait 10 seconds then activate the campaign
+Start-Sleep -Seconds 10
 LogToFile("Activating Campaign [$CampaignId] after finishing reassignment")
 Start-Campaign -Id "$CampaignId"
 
